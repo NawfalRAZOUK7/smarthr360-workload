@@ -15,3 +15,6 @@ smarthr360-jwt-auth @ git+https://github.com/NawfalRAZOUK7/smarthr360.git#subdir
 
 # Sibling service calls
 requests>=2.31
+
+# Observability
+django-prometheus>=2.3
