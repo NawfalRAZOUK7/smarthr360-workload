@@ -84,13 +84,19 @@ class ComputeScoreView(APIView):
         result = scoring.compute_score(user_id)
 
         retention_notified = False
+        email_sent = False
         if result.alert is not None:
             from .clients import RetentionClient
+            from .notifications import notify_burnout_alert
 
             retention_notified = RetentionClient(request.auth).notify_burnout(
                 user_id=user_id,
                 intensity=int(min(100, result.score)),
                 message=result.alert.message,
+            )
+            # email the affected employee (self-compute) or requester
+            email_sent = notify_burnout_alert(
+                getattr(request.user, "email", ""), result.alert
             )
 
         payload = {
@@ -102,6 +108,7 @@ class ComputeScoreView(APIView):
             if result.alert
             else None,
             "retention_notified": retention_notified,
+            "email_sent": email_sent,
         }
         return Response(payload, status=status.HTTP_201_CREATED)
 

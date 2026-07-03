@@ -243,3 +243,45 @@ class RetentionWiringTests(BaseCase):
         resp = self.client.post("/api/workload/scores/compute/", **bearer(72))
         self.assertEqual(resp.status_code, 201)          # scoring unaffected
         self.assertFalse(resp.json()["retention_notified"])
+
+
+class AlertEmailTests(BaseCase):
+    """Burnout alerts email the affected employee (+HR on CRITICAL)."""
+
+    @mock.patch("workload.clients.RetentionClient.notify_burnout")
+    def test_critical_alert_emails_employee_and_hr_inbox(self, mock_notify):
+        import os
+        from django.core import mail
+
+        mock_notify.return_value = True
+        today = date.today()
+        for i in range(8):
+            Task.objects.create(
+                user_id=80, title=f"t{i}", estimated_hours=6, complexity=5,
+                deadline=today, is_unplanned=True,
+            )
+        WorkdaySignal.objects.create(
+            user_id=80, date=today, meetings_count=8,
+            interruptions_count=8, stress_level=5,
+        )
+        os.environ["WORKLOAD_HR_EMAIL"] = "hr-alerts@corp.com"
+        try:
+            resp = self.client.post(
+                "/api/workload/scores/compute/", **bearer(80)
+            )
+        finally:
+            del os.environ["WORKLOAD_HR_EMAIL"]
+        self.assertTrue(resp.json()["email_sent"])
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("u80@corp.com", mail.outbox[0].to)
+        self.assertIn("hr-alerts@corp.com", mail.outbox[0].to)
+        self.assertIn("CRITICAL", mail.outbox[0].subject)
+
+    @mock.patch("workload.clients.RetentionClient.notify_burnout")
+    def test_no_alert_no_email(self, mock_notify):
+        from django.core import mail
+
+        resp = self.client.post("/api/workload/scores/compute/", **bearer(81))
+        self.assertFalse(resp.json()["email_sent"])
+        self.assertEqual(len(mail.outbox), 0)
+        mock_notify.assert_not_called()
