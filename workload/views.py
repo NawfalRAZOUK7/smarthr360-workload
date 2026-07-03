@@ -70,13 +70,29 @@ class WorkdaySignalListCreateView(generics.ListCreateAPIView):
 
 
 class ComputeScoreView(APIView):
-    """POST /scores/compute/ — run the scoring engine now."""
+    """POST /scores/compute/ — run the scoring engine now.
+
+    On HIGH/CRITICAL alerts, pushes a burnout signal to the retention
+    service (best-effort, token pass-through) so the retention chatbot
+    can reach out proactively — cross-service signal wiring.
+    """
 
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user_id = _target_user_id(request)
         result = scoring.compute_score(user_id)
+
+        retention_notified = False
+        if result.alert is not None:
+            from .clients import RetentionClient
+
+            retention_notified = RetentionClient(request.auth).notify_burnout(
+                user_id=user_id,
+                intensity=int(min(100, result.score)),
+                message=result.alert.message,
+            )
+
         payload = {
             "user_id": user_id,
             "score": result.score,
@@ -85,6 +101,7 @@ class ComputeScoreView(APIView):
             "alert": WorkloadAlertSerializer(result.alert).data
             if result.alert
             else None,
+            "retention_notified": retention_notified,
         }
         return Response(payload, status=status.HTTP_201_CREATED)
 

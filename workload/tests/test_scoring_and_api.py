@@ -2,6 +2,7 @@
 
 import time
 from datetime import date, timedelta
+from unittest import mock
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -197,3 +198,48 @@ class WorkloadAPITests(BaseCase):
         )
         self.assertEqual(ok.status_code, 200)
         self.assertTrue(ok.json()["acknowledged"])
+
+
+class RetentionWiringTests(BaseCase):
+    """Burnout alerts notify the retention service (mocked client)."""
+
+    def _overload(self, user_id):
+        today = date.today()
+        for i in range(8):
+            Task.objects.create(
+                user_id=user_id, title=f"t{i}", estimated_hours=6,
+                complexity=5, deadline=today, is_unplanned=True,
+            )
+        WorkdaySignal.objects.create(
+            user_id=user_id, date=today, meetings_count=8,
+            interruptions_count=8, stress_level=5,
+        )
+
+    @mock.patch("workload.clients.RetentionClient.notify_burnout")
+    def test_burnout_alert_notifies_retention(self, mock_notify):
+        mock_notify.return_value = True
+        self._overload(70)
+        resp = self.client.post("/api/workload/scores/compute/", **bearer(70))
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(resp.json()["retention_notified"])
+        mock_notify.assert_called_once()
+        kwargs = mock_notify.call_args.kwargs
+        self.assertEqual(kwargs["user_id"], 70)
+        self.assertGreaterEqual(kwargs["intensity"], 85)
+
+    @mock.patch("workload.clients.RetentionClient.notify_burnout")
+    def test_healthy_score_does_not_notify(self, mock_notify):
+        resp = self.client.post("/api/workload/scores/compute/", **bearer(71))
+        self.assertEqual(resp.status_code, 201)
+        self.assertFalse(resp.json()["retention_notified"])
+        mock_notify.assert_not_called()
+
+    @mock.patch("workload.clients.SESSION.post")
+    def test_retention_outage_never_breaks_scoring(self, mock_post):
+        import requests as _requests
+
+        mock_post.side_effect = _requests.ConnectionError("down")
+        self._overload(72)
+        resp = self.client.post("/api/workload/scores/compute/", **bearer(72))
+        self.assertEqual(resp.status_code, 201)          # scoring unaffected
+        self.assertFalse(resp.json()["retention_notified"])
