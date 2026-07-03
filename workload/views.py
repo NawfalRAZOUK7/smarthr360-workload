@@ -6,6 +6,7 @@ Scoping rules:
   the role level here; fine-grained team membership lives in core-hr)
 """
 
+from django.db.models import Sum
 from rest_framework import generics, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -164,3 +165,127 @@ class TeamOverviewView(APIView):
                 Task.objects.values_list("user_id", flat=True).distinct()
             )
         return Response({"team": scoring.team_overview(user_ids)})
+
+
+class ScoreTrendView(APIView):
+    """GET /api/workload/scores/trend/ — score history + direction.
+
+    Own trend by default; managers/HR may pass ?user_id=.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user_id = _target_user_id(request)
+        scores = list(
+            WorkloadScore.objects.filter(user_id=user_id)
+            .order_by("computed_at")[:90]
+        )
+        series = [
+            {
+                "computed_at": s.computed_at.isoformat(),
+                "score": s.score,
+                "level": s.level,
+            }
+            for s in scores
+        ]
+        direction = None
+        if len(series) >= 2:
+            delta = series[-1]["score"] - series[0]["score"]
+            direction = "worsening" if delta > 5 else (
+                "improving" if delta < -5 else "stable"
+            )
+        return Response(
+            {"user_id": user_id, "points": len(series),
+             "direction": direction, "series": series}
+        )
+
+
+class RebalancingView(APIView):
+    """GET /api/workload/rebalancing/ — who should hand what to whom.
+
+    Managers/HR only. The team comes from ?user_ids=1,2,3 or, when
+    omitted, from core-hr's my-team endpoint (token pass-through) —
+    so the suggestions NAME actual teammates.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    OVERLOAD_HOURS = 32.0   # 80% of a 40h week
+    RELIEF_HOURS = 24.0     # recipients should stay under this
+
+    def get(self, request):
+        if not has_manager_access(request.user):
+            raise PermissionDenied("Managers/HR only.")
+
+        raw = request.query_params.get("user_ids", "")
+        if raw:
+            try:
+                user_ids = [int(x) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                return Response(
+                    {"detail": "user_ids must be comma-separated integers."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            team_source = "query"
+        else:
+            from .clients import CoreHRClient
+
+            user_ids = CoreHRClient(request.auth).get_my_team_user_ids()
+            if user_ids is None:
+                return Response(
+                    {"detail": "core-hr unavailable and no user_ids given."},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            team_source = "core-hr my-team"
+
+        loads = {
+            uid: (
+                Task.objects.filter(user_id=uid, status__in=Task.OPEN_STATUSES)
+                .aggregate(h=Sum("estimated_hours"))["h"] or 0.0
+            )
+            for uid in user_ids
+        }
+
+        suggestions = []
+        for uid, hours in loads.items():
+            if hours < self.OVERLOAD_HOURS:
+                continue
+            candidates = sorted(
+                (c for c in user_ids
+                 if c != uid and loads[c] < self.RELIEF_HOURS),
+                key=lambda c: loads[c],
+            )
+            movable = list(
+                Task.objects.filter(user_id=uid, status=Task.Status.TODO)
+                .order_by("complexity", "-estimated_hours")[:3]
+            )
+            suggestions.append(
+                {
+                    "overloaded_user_id": uid,
+                    "open_hours": hours,
+                    "suggested_recipient_user_id":
+                        candidates[0] if candidates else None,
+                    "recipient_open_hours":
+                        loads[candidates[0]] if candidates else None,
+                    "tasks_to_move": [
+                        {"id": t.id, "title": t.title,
+                         "estimated_hours": t.estimated_hours,
+                         "complexity": t.complexity}
+                        for t in movable
+                    ],
+                    "note": None if candidates else
+                            "No teammate under the relief threshold — "
+                            "consider deadline renegotiation instead.",
+                }
+            )
+
+        return Response(
+            {
+                "team_source": team_source,
+                "team_size": len(user_ids),
+                "loads": loads,
+                "overload_threshold_hours": self.OVERLOAD_HOURS,
+                "suggestions": suggestions,
+            }
+        )

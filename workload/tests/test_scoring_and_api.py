@@ -285,3 +285,91 @@ class AlertEmailTests(BaseCase):
         self.assertFalse(resp.json()["email_sent"])
         self.assertEqual(len(mail.outbox), 0)
         mock_notify.assert_not_called()
+
+
+class TrendAndRebalancingTests(BaseCase):
+    def test_score_trend_direction(self):
+        for hours in (5, 20, 45):
+            Task.objects.all().delete()
+            Task.objects.create(user_id=90, title="t", estimated_hours=hours,
+                                complexity=3)
+            scoring.compute_score(90)
+        resp = self.client.get("/api/workload/scores/trend/", **bearer(90))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["points"], 3)
+        self.assertEqual(body["direction"], "worsening")
+
+    def test_rebalancing_names_least_loaded_teammate(self):
+        Task.objects.create(user_id=1, title="big", estimated_hours=40,
+                            complexity=3)
+        Task.objects.create(user_id=1, title="todo", estimated_hours=4,
+                            complexity=1)
+        Task.objects.create(user_id=2, title="light", estimated_hours=6,
+                            complexity=2)
+        Task.objects.create(user_id=3, title="medium", estimated_hours=20,
+                            complexity=2)
+
+        denied = self.client.get(
+            "/api/workload/rebalancing/?user_ids=1,2,3", **bearer(9)
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        resp = self.client.get(
+            "/api/workload/rebalancing/?user_ids=1,2,3",
+            **bearer(5, "MANAGER"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["team_source"], "query")
+        s = body["suggestions"][0]
+        self.assertEqual(s["overloaded_user_id"], 1)
+        self.assertEqual(s["suggested_recipient_user_id"], 2)  # 6h < 20h
+        self.assertTrue(s["tasks_to_move"])
+
+    @mock.patch("workload.clients.CoreHRClient.get_my_team_user_ids")
+    def test_rebalancing_pulls_team_from_core_hr(self, mock_team):
+        mock_team.return_value = [11, 12]
+        Task.objects.create(user_id=11, title="huge", estimated_hours=50,
+                            complexity=4, status=Task.Status.TODO)
+        resp = self.client.get(
+            "/api/workload/rebalancing/", **bearer(5, "MANAGER")
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["team_source"], "core-hr my-team")
+        self.assertEqual(
+            resp.json()["suggestions"][0]["suggested_recipient_user_id"], 12
+        )
+
+
+class ScheduledScoringCommandTests(BaseCase):
+    @mock.patch("workload.clients.RetentionClient.notify_burnout")
+    def test_command_scores_everyone_and_digests_critical(self, _):
+        import os
+        from io import StringIO
+
+        from django.core import mail
+        from django.core.management import call_command
+
+        today = date.today()
+        Task.objects.create(user_id=60, title="light", estimated_hours=4,
+                            complexity=2)
+        for i in range(8):
+            Task.objects.create(user_id=61, title=f"t{i}", estimated_hours=6,
+                                complexity=5, deadline=today,
+                                is_unplanned=True)
+        WorkdaySignal.objects.create(user_id=61, date=today, meetings_count=8,
+                                     interruptions_count=8, stress_level=5)
+
+        os.environ["WORKLOAD_HR_EMAIL"] = "hr-digest@corp.com"
+        out = StringIO()
+        try:
+            call_command("compute_all_scores", stdout=out)
+        finally:
+            del os.environ["WORKLOAD_HR_EMAIL"]
+
+        self.assertIn("scored=2 critical=1", out.getvalue())
+        self.assertEqual(WorkloadScore.objects.count(), 2)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("hr-digest@corp.com", mail.outbox[0].to)
+        self.assertIn("user_id=61", mail.outbox[0].body)

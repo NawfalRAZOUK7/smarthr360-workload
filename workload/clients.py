@@ -53,3 +53,33 @@ class RetentionClient:
         except requests.RequestException as exc:
             logger.warning("retention unreachable: %s", exc)
         return False
+
+
+class CoreHRClient:
+    """Reads the manager's team from smarthr360-core-hr (token
+    pass-through) so rebalancing can name actual teammates."""
+
+    def __init__(self, bearer_token: str):
+        self.base = os.environ.get(
+            "CORE_HR_API_URL", "http://core-hr:8000"
+        ).rstrip("/")
+        self.headers = {"Authorization": f"Bearer {bearer_token}"}
+
+    def get_my_team_user_ids(self) -> list[int] | None:
+        """user_ids of the caller's direct team; None when unavailable."""
+        try:
+            resp = SESSION.get(
+                f"{self.base}/api/hr/employees/my-team/",
+                headers=self.headers, timeout=DEFAULT_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                logger.warning("core-hr my-team returned %s", resp.status_code)
+                return None
+            payload = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("core-hr unavailable: %s", exc)
+            return None
+        data = payload.get("data", payload)
+        if isinstance(data, dict):
+            data = data.get("results", [])
+        return [p["user_id"] for p in data or [] if p.get("user_id")]
