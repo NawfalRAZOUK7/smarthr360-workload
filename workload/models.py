@@ -11,6 +11,8 @@ user table.
 
 from django.db import models
 
+from smarthr360_integration.history import SCD2HistoryBase
+
 
 class Task(models.Model):
     """A unit of work assigned to an employee."""
@@ -24,7 +26,9 @@ class Task(models.Model):
     user_id = models.PositiveBigIntegerField(db_index=True)
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=Status.choices, default=Status.TODO)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.TODO
+    )
 
     estimated_hours = models.FloatField(default=1.0)
     complexity = models.PositiveSmallIntegerField(
@@ -35,7 +39,9 @@ class Task(models.Model):
         default=False, help_text="Unexpected task (legacy TacheImprevue)"
     )
     reference = models.CharField(
-        max_length=100, blank=True, help_text="Calibrated-task reference (legacy TacheCalibree)"
+        max_length=100,
+        blank=True,
+        help_text="Calibrated-task reference (legacy TacheCalibree)",
     )
 
     created_by_user_id = models.PositiveBigIntegerField(null=True, blank=True)
@@ -115,3 +121,47 @@ class WorkloadAlert(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class WorkloadLevelHistory(SCD2HistoryBase):
+    """SCD Type 2 timeline of an employee's workload *level* transitions.
+
+    Uses the shared ``SCD2HistoryBase`` (smarthr360-integration) — no history
+    logic is re-implemented here. One open row per employee tracks how long they
+    have been at a given band (OK / ELEVATED / HIGH / BURNOUT_RISK), enabling
+    BI like "days spent at burnout risk" and trend context for the forecast.
+    """
+
+    employee_user_id = models.PositiveBigIntegerField(db_index=True)
+    level = models.CharField(max_length=20)
+
+    #: Owner identity used by snapshot_history to find the open row.
+    SCD2_OWNER_FIELDS = ("employee_user_id",)
+
+    class Meta:
+        ordering = ["employee_user_id", "-date_debut"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee_user_id"],
+                condition=models.Q(date_fin__isnull=True),
+                name="uniq_open_workload_level_per_employee",
+            ),
+            models.UniqueConstraint(
+                fields=["employee_user_id", "version"],
+                name="uniq_workload_level_version",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["employee_user_id", "is_current"],
+                name="wl_levelhist_emp_curr_idx",
+            ),
+        ]
+
+    @property
+    def tracked_snapshot(self) -> dict:
+        return {"level": self.level}
+
+    def __str__(self):
+        end = self.date_fin.date() if self.date_fin else "present"
+        return f"user {self.employee_user_id} {self.level} [v{self.version} →{end}]"

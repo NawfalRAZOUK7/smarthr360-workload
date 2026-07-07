@@ -21,7 +21,16 @@ from datetime import date, timedelta
 
 from django.db.models import Sum
 
-from ..models import Task, WorkdaySignal, WorkloadAlert, WorkloadScore
+from smarthr360_integration.history import snapshot_history
+
+from ..metrics import record_score
+from ..models import (
+    Task,
+    WorkdaySignal,
+    WorkloadAlert,
+    WorkloadLevelHistory,
+    WorkloadScore,
+)
 
 WEEKLY_CAPACITY_HOURS = 40.0
 DEADLINE_WINDOW_DAYS = 3
@@ -171,6 +180,17 @@ def compute_score(user_id: int, today: date | None = None) -> ScoreResult:
             ),
             recommendations=_recommendations(components),
         )
+
+    # SCD2: record a new version only when the employee's *level* changes
+    # (idempotent via the shared history service). Fed to BI + forecast context.
+    snapshot_history(
+        WorkloadLevelHistory,
+        owner_filter={"employee_user_id": user_id},
+        snapshot={"level": level},
+        source_system="WORKLOAD",
+    )
+    # Prometheus: count computes by level (exposed on /metrics).
+    record_score(level)
 
     return ScoreResult(score=score, level=level, components=components, alert=alert)
 
