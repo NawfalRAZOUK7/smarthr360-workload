@@ -100,7 +100,6 @@ def _forecast_from_points(
     current = points[-1][1]
     slope = linear_trend(points)  # score units per day
 
-    x_now = (now - t0).total_seconds() / 86400.0
     projected = clamp(project(current, slope, horizon_days), 0.0, 100.0)
     projected_level = level_for(projected)
     trending = projected_level in ("HIGH", "BURNOUT_RISK") and slope > 0
