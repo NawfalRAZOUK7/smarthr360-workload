@@ -14,7 +14,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from smarthr360_jwt_auth.access import has_manager_access
+from smarthr360_jwt_auth.access import (
+    has_hr_access,
+    has_manager_access,
+    is_manager,
+)
 
 from .models import Task, WorkdaySignal, WorkloadAlert, WorkloadScore
 from .serializers import (
@@ -41,11 +45,34 @@ class TaskViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if has_manager_access(self.request.user):
-            requested = self.request.query_params.get("user_id")
+        user = self.request.user
+        requested = self.request.query_params.get("user_id")
+
+        # HR / Admin: unrestricted, with an optional ?user_id= filter.
+        if has_hr_access(user):
             qs = Task.objects.all()
             return qs.filter(user_id=requested) if requested else qs
-        return Task.objects.filter(user_id=self.request.user.id)
+
+        # Manager (not HR): row-level scoping to their direct team + self.
+        # The team roster is owned by core-hr; if it is unreachable we fail
+        # closed to the manager's own tasks rather than leaking everyone's.
+        if is_manager(user):
+            from .clients import CoreHRClient
+
+            team = CoreHRClient(self.request.auth).get_my_team_user_ids() or []
+            allowed = set(team)
+            allowed.add(int(user.id))
+            if requested:
+                rid = int(requested)
+                return (
+                    Task.objects.filter(user_id=rid)
+                    if rid in allowed
+                    else Task.objects.none()
+                )
+            return Task.objects.filter(user_id__in=allowed)
+
+        # Employee: strictly their own tasks.
+        return Task.objects.filter(user_id=user.id)
 
     def perform_create(self, serializer):
         user_id = serializer.validated_data.get("user_id") or self.request.user.id
@@ -127,11 +154,33 @@ class AlertViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if has_manager_access(self.request.user):
-            requested = self.request.query_params.get("user_id")
+        user = self.request.user
+        requested = self.request.query_params.get("user_id")
+
+        # HR / Admin: unrestricted (optional ?user_id= filter).
+        if has_hr_access(user):
             qs = WorkloadAlert.objects.all()
             return qs.filter(user_id=requested) if requested else qs
-        return WorkloadAlert.objects.filter(user_id=self.request.user.id)
+
+        # Manager (not HR): scoped to their direct team + self (same team
+        # roster used for task scoping); fails closed to their own alerts.
+        if is_manager(user):
+            from .clients import CoreHRClient
+
+            team = CoreHRClient(self.request.auth).get_my_team_user_ids() or []
+            allowed = set(team)
+            allowed.add(int(user.id))
+            if requested:
+                rid = int(requested)
+                return (
+                    WorkloadAlert.objects.filter(user_id=rid)
+                    if rid in allowed
+                    else WorkloadAlert.objects.none()
+                )
+            return WorkloadAlert.objects.filter(user_id__in=allowed)
+
+        # Employee: their own alerts only.
+        return WorkloadAlert.objects.filter(user_id=user.id)
 
     @action(detail=True, methods=["post"])
     def acknowledge(self, request, pk=None):

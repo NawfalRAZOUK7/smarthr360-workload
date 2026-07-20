@@ -30,14 +30,14 @@ PUBLIC_PEM = (
 )
 
 
-def bearer(user_id, role="EMPLOYEE"):
+def bearer(user_id, role="EMPLOYEE", groups=None):
     token = jwt.encode(
         {
             "token_type": "access",
             "user_id": user_id,
             "email": f"u{user_id}@corp.com",
             "role": role,
-            "groups": [],
+            "groups": groups or [],
             "iss": "smarthr360",
             "exp": int(time.time()) + 300,
         },
@@ -141,6 +141,55 @@ class WorkloadAPITests(BaseCase):
         self.assertEqual(ok.status_code, 201)
         self.assertEqual(ok.json()["created_by_user_id"], 1)
 
+    @mock.patch("workload.clients.CoreHRClient.get_my_team_user_ids")
+    def test_manager_task_list_scoped_to_team(self, mock_team):
+        # A manager sees only their direct reports' tasks (+ their own),
+        # not every user's — row-level scoping via the core-hr team roster.
+        mock_team.return_value = [10, 11]
+        Task.objects.create(user_id=10, title="a", estimated_hours=4)
+        Task.objects.create(user_id=11, title="b", estimated_hours=4)
+        Task.objects.create(user_id=99, title="c", estimated_hours=4)  # not on team
+
+        resp = self.client.get("/api/workload/tasks/", **bearer(1, "MANAGER"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["meta"]["count"], 2)  # 10 & 11 only, not 99
+
+        # explicitly requesting an out-of-team user returns nothing
+        outside = self.client.get(
+            "/api/workload/tasks/?user_id=99", **bearer(1, "MANAGER")
+        )
+        self.assertEqual(outside.json()["meta"]["count"], 0)
+
+    def test_hr_task_list_is_unrestricted(self):
+        Task.objects.create(user_id=10, title="a", estimated_hours=4)
+        Task.objects.create(user_id=99, title="c", estimated_hours=4)
+        resp = self.client.get("/api/workload/tasks/", **bearer(1, "HR"))
+        self.assertEqual(resp.json()["meta"]["count"], 2)
+
+    def _make_alert(self, user_id):
+        score = WorkloadScore.objects.create(
+            user_id=user_id, score=90.0, level="BURNOUT_RISK"
+        )
+        return WorkloadAlert.objects.create(
+            user_id=user_id, score=score, level="CRITICAL", message="overloaded"
+        )
+
+    @mock.patch("workload.clients.CoreHRClient.get_my_team_user_ids")
+    def test_manager_alert_list_scoped_to_team(self, mock_team):
+        # Overload alerts follow the same team-scoping as tasks.
+        mock_team.return_value = [10, 11]
+        for uid in (10, 11, 99):
+            self._make_alert(uid)
+        resp = self.client.get("/api/workload/alerts/", **bearer(1, "MANAGER"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["meta"]["count"], 2)  # 10 & 11, not 99
+
+    def test_hr_alert_list_is_unrestricted(self):
+        for uid in (10, 99):
+            self._make_alert(uid)
+        resp = self.client.get("/api/workload/alerts/", **bearer(1, "HR"))
+        self.assertEqual(resp.json()["meta"]["count"], 2)
+
     def test_compute_and_read_score(self):
         Task.objects.create(user_id=20, title="t", estimated_hours=30, complexity=4)
         resp = self.client.post("/api/workload/scores/compute/", **bearer(20))
@@ -174,7 +223,10 @@ class WorkloadAPITests(BaseCase):
         self.assertEqual(resp.json()["team"][0]["user_id"], 6)
         self.assertIsNotNone(resp.json()["team"][0]["score"])
 
-    def test_alert_acknowledge_flow(self):
+    @mock.patch("workload.clients.CoreHRClient.get_my_team_user_ids")
+    def test_alert_acknowledge_flow(self, mock_team):
+        # Manager acknowledging is now team-scoped: user 40 is on their team.
+        mock_team.return_value = [40]
         today = date.today()
         for i in range(8):
             Task.objects.create(
@@ -373,3 +425,57 @@ class ScheduledScoringCommandTests(BaseCase):
         self.assertEqual(len(mail.outbox), 1)
         self.assertIn("hr-digest@corp.com", mail.outbox[0].to)
         self.assertIn("user_id=61", mail.outbox[0].body)
+
+
+class AuditorReadOnlyTests(BaseCase):
+    """The AUDITOR group (public demo guest) must never write.
+
+    Enforced by smarthr360_jwt_auth.readonly.AuditorReadOnlyMiddleware. These
+    endpoints are self-scoped, so a plain EMPLOYEE may legitimately write to
+    them — which is exactly why the auditor rule cannot live in the per-view
+    permission classes here.
+    """
+
+    WRITE_ENDPOINTS = (
+        "/api/workload/tasks/",
+        "/api/workload/signals/",
+        "/api/workload/scores/compute/",
+    )
+
+    def test_auditor_cannot_write(self):
+        for url in self.WRITE_ENDPOINTS:
+            with self.subTest(url=url):
+                resp = self.client.post(
+                    url,
+                    data="{}",
+                    content_type="application/json",
+                    **bearer(28, "EMPLOYEE", groups=["EMPLOYEE", "AUDITOR"]),
+                )
+                self.assertEqual(resp.status_code, 403, f"{url} allowed an auditor write")
+
+    def test_auditor_can_still_read(self):
+        resp = self.client.get(
+            "/api/workload/tasks/",
+            **bearer(28, "EMPLOYEE", groups=["EMPLOYEE", "AUDITOR"]),
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_plain_employee_write_is_unaffected(self):
+        """Guard against the fix over-reaching into normal employee access."""
+        resp = self.client.post(
+            "/api/workload/scores/compute/",
+            data="{}",
+            content_type="application/json",
+            **bearer(29, "EMPLOYEE"),
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_admin_write_is_unaffected(self):
+        """is_auditor() is true for admins too; they must not be locked out."""
+        resp = self.client.post(
+            "/api/workload/scores/compute/",
+            data="{}",
+            content_type="application/json",
+            **bearer(1, "ADMIN"),
+        )
+        self.assertEqual(resp.status_code, 201)

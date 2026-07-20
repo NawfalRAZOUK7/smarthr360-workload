@@ -12,6 +12,8 @@ from .views import (
     WorkdaySignalListCreateView,
 )
 from .views_forecast import BurnoutForecastView, TeamBurnoutForecastView
+from .views_export import WorkloadExportView
+from .views_import import WorkloadTaskImportView
 
 router = DefaultRouter()
 router.register("tasks", TaskViewSet, basename="workload-task")
@@ -26,5 +28,7 @@ urlpatterns = [
     path("forecast/team/", TeamBurnoutForecastView.as_view(), name="workload-forecast-team"),
     path("rebalancing/", RebalancingView.as_view(), name="workload-rebalancing"),
     path("team-overview/", TeamOverviewView.as_view(), name="workload-team-overview"),
+    path("export/", WorkloadExportView.as_view(), name="workload-export"),
+    path("tasks/import/", WorkloadTaskImportView.as_view(), name="workload-task-import"),
     path("", include(router.urls)),
 ]

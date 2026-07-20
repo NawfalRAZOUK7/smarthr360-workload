@@ -31,6 +31,8 @@ WORKLOAD_FORECASTS = get_counter(
 WORKLOAD_FORECAST_LAST_RUN = get_gauge(
     "workload_forecast_last_run_timestamp_seconds",
     "Unix time of the last burnout forecast run.",
+    # A timestamp: take the latest across workers, not the sum.
+    multiprocess_mode="max",
 )
 
 
